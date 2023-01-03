@@ -60,11 +60,15 @@ from transformers import (
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
+# Typing
+from datasets.dataset_dict import DatasetDict
+from optax import Schedule
+
 
 logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_CAUSAL_LM_MAPPING.keys())
-MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)  # type: ignore
 
 
 @dataclass
@@ -124,7 +128,7 @@ class TrainingArguments:
     save_steps: int = field(
         default=500, metadata={"help": "Save checkpoint every X updates steps."}
     )
-    eval_steps: int = field(
+    eval_steps: Optional[int] = field(
         default=None, metadata={"help": "Run an evaluation every X steps."}
     )
     seed: int = field(
@@ -137,13 +141,13 @@ class TrainingArguments:
             "help": "Whether or not to upload the trained model to the model hub after training."
         },
     )
-    hub_model_id: str = field(
+    hub_model_id: Optional[str] = field(
         default=None,
         metadata={
             "help": "The name of the repository to keep in sync with the local `output_dir`."
         },
     )
-    hub_token: str = field(
+    hub_token: Optional[str] = field(
         default=None, metadata={"help": "The token to use to push to the Model Hub."}
     )
 
@@ -344,7 +348,7 @@ class TrainState(train_state.TrainState):
 
 
 def data_loader(
-    rng: jax.random.PRNGKey,
+    rng: jax.random.PRNGKeyArray,
     dataset: Dataset,
     batch_size: int,
     shuffle: bool = False,
@@ -396,7 +400,7 @@ def create_learning_rate_fn(
     num_train_epochs: int,
     num_warmup_steps: int,
     learning_rate: float,
-) -> Callable[[int], jnp.array]:
+) -> Schedule:
     """Returns a linear warmup, linear_decay learning rate function."""
     steps_per_epoch = train_ds_size // train_batch_size
     num_train_steps = steps_per_epoch * num_train_epochs
@@ -497,6 +501,9 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
+        # References to dataset.keys() implies that
+        # the dataset is an instance of DatasetDict, not arrow dataset.
+        assert isinstance(dataset, DatasetDict)
         if "validation" not in dataset.keys():
             dataset["validation"] = load_dataset(
                 data_args.dataset_name,
@@ -531,6 +538,7 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
+        assert isinstance(dataset, DatasetDict)
         if "validation" not in dataset.keys():
             dataset["validation"] = load_dataset(
                 extension,
