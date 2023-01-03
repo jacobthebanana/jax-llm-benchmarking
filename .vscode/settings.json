@@ -1,0 +1,27 @@
+{
+    "cSpell.words": [
+        "adafactor",
+        "Adafactor",
+        "adamw",
+        "dtype",
+        "huggingface",
+        "layernorm",
+        "levelname",
+        "logits",
+        "onehot",
+        "optax",
+        "Optax's",
+        "pmap",
+        "pmean",
+        "pretrained",
+        "Pretrained",
+        "prng",
+        "PRNG",
+        "softmax",
+        "tensorboard",
+        "tqdm",
+        "unflatten",
+        "unpad",
+        "unreplicate"
+    ]
+}
