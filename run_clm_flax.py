@@ -65,6 +65,8 @@ import wandb
 from datasets.dataset_dict import DatasetDict
 from optax import Schedule
 
+# Sharding
+from partition_utils import get_sharding_scheme
 
 logger = logging.getLogger(__name__)
 
@@ -610,14 +612,26 @@ def main():
         )
 
     if model_args.model_name_or_path:
-        model = FlaxAutoModelForCausalLM.from_pretrained(
+        print("Loading model weights to CPU.")
+        model, params_cpu = FlaxAutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             config=config,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
             use_auth_token=True if model_args.use_auth_token else None,
+            _do_init=False,
         )
+
+        print("Generating param sharding layout config.")
+        sharding_scheme = get_sharding_scheme(params_cpu, num_replicas=1)
+
+        print("Sending sharded model weights to accelerator(s).")
+        model.params = jax.device_put(params_cpu, device=sharding_scheme)
+
     else:
+        raise NotImplementedError(
+            "Initializing model from scratch is not yet supported."
+        )
         model = FlaxAutoModelForCausalLM.from_config(
             config,
             seed=training_args.seed,
@@ -729,11 +743,9 @@ def main():
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
-    train_batch_size = (
-        int(training_args.per_device_train_batch_size) * jax.device_count()
-    )
+    train_batch_size = int(training_args.per_device_train_batch_size)
     per_device_eval_batch_size = int(training_args.per_device_eval_batch_size)
-    eval_batch_size = per_device_eval_batch_size * jax.device_count()
+    eval_batch_size = per_device_eval_batch_size
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
 
@@ -849,7 +861,7 @@ def main():
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {num_epochs}")
     logger.info(
-        f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}"
+        f"  Instantaneous batch size per virtual device = {training_args.per_device_train_batch_size}"
     )
     logger.info(
         f"  Total train batch size (w. parallel & distributed) = {train_batch_size}"
