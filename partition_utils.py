@@ -4,6 +4,7 @@ Utilities for generating sharding/partition layout specs.
 import jax
 import jax.numpy as jnp
 from flax.traverse_util import flatten_dict, unflatten_dict
+from flax.core.frozen_dict import unfreeze
 
 from typing import Dict, List, Tuple, Union
 from jax.sharding import PositionalSharding
@@ -61,4 +62,4 @@ def get_sharding_scheme(
     for extra_key in extra_keys_nonsharded:
         replicated_param_keys[extra_key] = base_sharding.replicate()
 
-    return unflatten_dict(replicated_param_keys)  # type: ignore
+    return unfreeze(unflatten_dict(replicated_param_keys))  # type: ignore

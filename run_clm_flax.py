@@ -42,10 +42,10 @@ import jax
 import jax.numpy as jnp
 import optax
 import transformers
-from flax import jax_utils, traverse_util
-from flax.jax_utils import pad_shard_unpad, unreplicate
+from flax import traverse_util
 from flax.training import train_state
-from flax.training.common_utils import get_metrics, onehot, shard, shard_prng_key
+from flax.training.common_utils import onehot, stack_forest
+from flax.core.frozen_dict import unfreeze
 from huggingface_hub import Repository
 from transformers import (
     CONFIG_MAPPING,
@@ -129,7 +129,7 @@ class TrainingArguments:
         default=0, metadata={"help": "Linear warmup over warmup_steps."}
     )
     logging_steps: int = field(
-        default=500, metadata={"help": "Log every X updates steps."}
+        default=10, metadata={"help": "Log every X updates steps."}
     )
     save_steps: int = field(
         default=500, metadata={"help": "Save checkpoint every X updates steps."}
@@ -350,11 +350,6 @@ class DataTrainingArguments:
 class TrainState(train_state.TrainState):
     dropout_rng: jnp.ndarray
 
-    def replicate(self):
-        return jax_utils.replicate(self).replace(
-            dropout_rng=shard_prng_key(self.dropout_rng)
-        )
-
 
 def data_loader(
     rng: jax.random.PRNGKeyArray,
@@ -394,7 +389,7 @@ def write_train_metric(train_metrics, train_time, step):
     stats["step"] = step
     wandb.log(stats)
 
-    train_metrics = get_metrics(train_metrics)
+    train_metrics = stack_forest(train_metrics)
     for key, vals in train_metrics.items():
         tag = f"train_{key}"
         for i, val in enumerate(vals):
@@ -510,11 +505,21 @@ def main():
     # download the dataset.
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
+        dataset = DatasetDict()
+        dataset["train"] = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
             cache_dir=model_args.cache_dir,
             keep_in_memory=False,
+            split="train[2%:5%]",
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+        dataset["validation"] = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            cache_dir=model_args.cache_dir,
+            keep_in_memory=False,
+            split="train[:2%]",
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
@@ -650,7 +655,11 @@ def main():
 
     def tokenize_function(examples):
         with CaptureLogger(tok_logger) as cl:
-            output = tokenizer(examples[text_column_name])
+            output = tokenizer(
+                examples[text_column_name],
+                max_length=data_args.block_size,
+                padding=True,
+            )
         # clm input could be much much longer than block_size
         if "Token indices sequence length is longer than the" in cl.out:
             tok_logger.warning(
@@ -736,7 +745,6 @@ def main():
         wandb_entity: str = training_args.wandb_entity
         wandb_run_name = datetime.datetime.now().isoformat() + "-" + gethostname()
         wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name)
-        wandb.config.update({**model_args, **data_args, **training_args})
 
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
@@ -806,7 +814,7 @@ def main():
     initial_params = jax.device_put(initial_params_cpu, device=sharding_scheme)
 
     print("Initializing model weights on accelerator(s).")
-    jax.jit(model.init_weights, static_argnames=["input_shape"])(
+    filled_params = jax.jit(model.init_weights, static_argnames=["input_shape"])(
         rng=jax.random.PRNGKey(training_args.seed),
         input_shape=(train_batch_size, block_size),
         params=initial_params,
@@ -814,7 +822,7 @@ def main():
 
     state = TrainState.create(
         apply_fn=model.__call__,
-        params=model.params,
+        params=unfreeze(filled_params),
         tx=optimizer,
         dropout_rng=dropout_rng,
     )
@@ -833,43 +841,41 @@ def main():
 
         def compute_loss(params):
             labels = batch.pop("labels")
-            logits = state.apply_fn(
-                **batch, params=params, dropout_rng=dropout_rng, train=True
-            )[0]
+            logits = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng)[0]
             loss = loss_fn(logits, labels)
             return loss
 
         grad_fn = jax.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
-        grad = jax.lax.pmean(grad, "batch")
 
-        new_state = state.apply_gradients(grads=grad, dropout_rng=new_dropout_rng)
-
+        updates, new_opt_state = state.tx.update(grad, state.opt_state, state.params)
+        new_params = optax.apply_updates(state.params, updates)
+        new_state = state.replace(
+            step=state.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+            dropout_rng=new_dropout_rng,
+        )
         metrics = {
             "loss": loss,
             "learning_rate": linear_decay_lr_schedule_fn(state.step),
         }
-        metrics = jax.lax.pmean(metrics, axis_name="batch")
 
         return new_state, metrics
 
     # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
-        logits = model(**batch, params=params, train=False)[0]
+        logits = model(**batch, params=params)[0]
         loss = loss_fn(logits, labels)
 
         # summarize metrics
         metrics = {"loss": loss}
-        metrics = jax.lax.pmean(metrics, axis_name="batch")
         return metrics
 
     # Create parallel version of the train and eval step
-    p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0,))
-    p_eval_step = jax.pmap(eval_step, "batch")
-
-    # Replicate the train state on each device
-    state = state.replicate()
+    p_train_step = jax.jit(train_step)
+    p_eval_step = jax.jit(eval_step)
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -896,21 +902,25 @@ def main():
         train_loader = data_loader(
             input_rng, train_dataset, train_batch_size, shuffle=True
         )
-        steps_per_epoch = len(train_dataset) // train_batch_size
+        steps_per_epoch = min(200, len(train_dataset) // train_batch_size)
+
         # train
         for step in tqdm(
             range(steps_per_epoch), desc="Training...", position=1, leave=False
         ):
+            step_start_time = time.time()
             batch = next(train_loader)
-            batch = shard(batch)
+            effective_batch_size = len(batch["labels"].flatten())
             state, train_metric = p_train_step(state, batch)
+            train_metric["throughput"] = effective_batch_size / (
+                time.time() - step_start_time
+            )
             train_metrics.append(train_metric)
 
             cur_step = epoch * (len(train_dataset) // train_batch_size) + step
 
             if cur_step % training_args.logging_steps == 0 and cur_step > 0:
                 # Save metrics
-                train_metric = unreplicate(train_metric)
                 train_time += time.time() - train_start
                 if jax.process_index() == 0:
                     write_train_metric(train_metrics, train_time, cur_step)
@@ -928,19 +938,17 @@ def main():
                 eval_loader = data_loader(
                     input_rng, eval_dataset, eval_batch_size, drop_last=False
                 )
-                eval_steps = math.ceil(len(eval_dataset) / eval_batch_size)
+                eval_steps = min(200, math.ceil(len(eval_dataset) / eval_batch_size))
                 for _ in tqdm(
                     range(eval_steps), desc="Evaluating...", position=2, leave=False
                 ):
                     # Model forward
                     batch = next(eval_loader)
-                    metrics = pad_shard_unpad(p_eval_step, static_return=True)(
-                        state.params, batch, min_device_batch=per_device_eval_batch_size
-                    )
+                    metrics = p_eval_step(state.params, batch)
                     eval_metrics.append(metrics)
 
                 # normalize eval metrics
-                eval_metrics = get_metrics(eval_metrics)
+                eval_metrics = stack_forest(eval_metrics)
                 eval_metrics = jax.tree_util.tree_map(jnp.mean, eval_metrics)
 
                 try:
@@ -963,7 +971,7 @@ def main():
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
                 if jax.process_index() == 0:
-                    params = jax.device_get(unreplicate(state.params))
+                    params = jax.device_get(state.params)
                     model.save_pretrained(training_args.output_dir, params=params)
                     tokenizer.save_pretrained(training_args.output_dir)
                     if training_args.push_to_hub:
@@ -978,17 +986,15 @@ def main():
         eval_loader = data_loader(
             input_rng, eval_dataset, eval_batch_size, drop_last=False
         )
-        eval_steps = math.ceil(len(eval_dataset) / eval_batch_size)
+        eval_steps = min(200, math.ceil(len(eval_dataset) / eval_batch_size))
         for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
             # Model forward
             batch = next(eval_loader)
-            metrics = pad_shard_unpad(p_eval_step, static_return=True)(
-                state.params, batch, min_device_batch=per_device_eval_batch_size
-            )
+            metrics = p_eval_step(state.params, batch)
             eval_metrics.append(metrics)
 
         # normalize eval metrics
-        eval_metrics = get_metrics(eval_metrics)
+        eval_metrics = stack_forest(eval_metrics)
         eval_metrics = jax.tree_util.tree_map(
             lambda x: jnp.mean(x).item(), eval_metrics
         )
@@ -1006,6 +1012,8 @@ def main():
             path = os.path.join(training_args.output_dir, "eval_results.json")
             with open(path, "w") as f:
                 json.dump(eval_metrics, f, indent=4, sort_keys=True)
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
