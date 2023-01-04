@@ -59,7 +59,10 @@ from transformers import (
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
+# WandB Integration
 import wandb
+import datetime
+from socket import gethostname
 
 # Typing
 from datasets.dataset_dict import DatasetDict
@@ -144,6 +147,9 @@ class TrainingArguments:
             "help": "Whether or not to upload the trained model to the model hub after training."
         },
     )
+    wandb_project: Optional[str] = field(default=None)
+    wandb_entity: Optional[str] = field(default=None)
+
     hub_model_id: Optional[str] = field(
         default=None,
         metadata={
@@ -611,9 +617,9 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    print("Loading model weights to CPU.")
     if model_args.model_name_or_path:
-        print("Loading model weights to CPU.")
-        model, params_cpu = FlaxAutoModelForCausalLM.from_pretrained(
+        model, initial_params_cpu = FlaxAutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             config=config,
             seed=training_args.seed,
@@ -621,21 +627,12 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
             _do_init=False,
         )
-
-        print("Generating param sharding layout config.")
-        sharding_scheme = get_sharding_scheme(params_cpu, num_replicas=1)
-
-        print("Sending sharded model weights to accelerator(s).")
-        model.params = jax.device_put(params_cpu, device=sharding_scheme)
-
     else:
-        raise NotImplementedError(
-            "Initializing model from scratch is not yet supported."
-        )
-        model = FlaxAutoModelForCausalLM.from_config(
+        model, initial_params_cpu = FlaxAutoModelForCausalLM.from_config(
             config,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
+            _do_init=False,
         )
 
     # Preprocessing the datasets.
@@ -735,7 +732,11 @@ def main():
 
     # Enable wandb only on the master node
     if jax.process_index() == 0:
-        wandb.init()
+        wandb_project: str = training_args.wandb_project
+        wandb_entity: str = training_args.wandb_entity
+        wandb_run_name = datetime.datetime.now().isoformat() + "-" + gethostname()
+        wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name)
+        wandb.config.update({**model_args, **data_args, **training_args})
 
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
@@ -798,6 +799,19 @@ def main():
         )
 
     # Setup train state
+    print("Generating param sharding layout config.")
+    sharding_scheme = get_sharding_scheme(initial_params_cpu, num_replicas=1)
+
+    print("Sending sharded model weights to accelerator(s).")
+    initial_params = jax.device_put(initial_params_cpu, device=sharding_scheme)
+
+    print("Initializing model weights on accelerator(s).")
+    jax.jit(model.init_weights, static_argnames=["input_shape"])(
+        rng=jax.random.PRNGKey(training_args.seed),
+        input_shape=(train_batch_size, block_size),
+        params=initial_params,
+    )
+
     state = TrainState.create(
         apply_fn=model.__call__,
         params=model.params,
