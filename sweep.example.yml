@@ -1,0 +1,51 @@
+command:
+  - python3
+  - run_clm_flax.py
+  - ${args}
+method: grid
+metric:
+  goal: minimize
+  name: eval_accuracy
+parameters:
+  block_size:
+    values:
+      - 128
+      - 256
+      - 512
+  dataset_config_name:
+    value: wikitext-103-v1
+  dataset_name:
+    value: wikitext
+  do_eval:
+    value: 1
+  do_train:
+    value: 1
+  eval_steps:
+    value: 2500
+  logging_steps:
+    value: 1
+  model_name_or_path:
+    values:
+      - facebook/opt-125m
+      - facebook/opt-350m
+      - facebook/opt-1.3b
+      - facebook/opt-2.7b
+      - facebook/opt-6.7b
+      - facebook/opt-13b
+  model_type:
+    value: opt
+  num_train_epochs:
+    value: 1
+  output_dir:
+    value: /data/jax-benchmarking/models/sweep
+  overwrite_output_dir:
+    value: 1
+  per_device_eval_batch_size:
+    value: 2
+  per_device_train_batch_size:
+    values:
+      - 2
+      - 16
+      - 128
+  save_steps:
+    value: 2500
