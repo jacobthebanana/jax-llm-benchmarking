@@ -54,11 +54,12 @@ from transformers import (
     AutoTokenizer,
     FlaxAutoModelForCausalLM,
     HfArgumentParser,
-    is_tensorboard_available,
     set_seed,
 )
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
+
+import wandb
 
 # Typing
 from datasets.dataset_dict import DatasetDict
@@ -379,19 +380,27 @@ def data_loader(
         yield batch
 
 
-def write_train_metric(summary_writer, train_metrics, train_time, step):
-    summary_writer.scalar("train_time", train_time, step)
+def write_train_metric(train_metrics, train_time, step):
+    stats = {}
+    stats["train_time"] = train_time
+    stats["step"] = step
+    wandb.log(stats)
 
     train_metrics = get_metrics(train_metrics)
     for key, vals in train_metrics.items():
         tag = f"train_{key}"
         for i, val in enumerate(vals):
-            summary_writer.scalar(tag, val, step - len(vals) + i + 1)
+            stats = {}
+            stats["step"] = step - len(vals) + i + 1
+            stats[tag] = float(val)
+            wandb.log(stats)
 
 
-def write_eval_metric(summary_writer, eval_metrics, step):
+def write_eval_metric(eval_metrics, step):
+    stats = {}
     for metric_name, value in eval_metrics.items():
-        summary_writer.scalar(f"eval_{metric_name}", value, step)
+        stats["step"] = step
+        stats[f"eval_{metric_name}"] = float(value)
 
 
 def create_learning_rate_fn(
@@ -710,23 +719,9 @@ def main():
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
 
-    # Enable tensorboard only on the master node
-    has_tensorboard = is_tensorboard_available()
-    if has_tensorboard and jax.process_index() == 0:
-        try:
-            from flax.metrics.tensorboard import SummaryWriter
-
-            summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir))
-        except ImportError as ie:
-            has_tensorboard = False
-            logger.warning(
-                f"Unable to display metrics through TensorBoard because some package are not installed: {ie}"
-            )
-    else:
-        logger.warning(
-            "Unable to display metrics through TensorBoard because the package is not installed: "
-            "Please run pip install tensorboard to enable."
-        )
+    # Enable wandb only on the master node
+    if jax.process_index() == 0:
+        wandb.init()
 
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
@@ -891,10 +886,8 @@ def main():
                 # Save metrics
                 train_metric = unreplicate(train_metric)
                 train_time += time.time() - train_start
-                if has_tensorboard and jax.process_index() == 0:
-                    write_train_metric(
-                        summary_writer, train_metrics, train_time, cur_step
-                    )
+                if jax.process_index() == 0:
+                    write_train_metric(train_metrics, train_time, cur_step)
 
                 epochs.write(
                     f"Step... ({cur_step} | Loss: {train_metric['loss'].mean()}, Learning Rate:"
@@ -938,8 +931,8 @@ def main():
                 epochs.desc = desc
 
                 # Save metrics
-                if has_tensorboard and jax.process_index() == 0:
-                    write_eval_metric(summary_writer, eval_metrics, cur_step)
+                if jax.process_index() == 0:
+                    write_eval_metric(eval_metrics, cur_step)
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
