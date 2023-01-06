@@ -40,6 +40,8 @@ from tqdm import tqdm
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.multihost_utils import process_allgather
+
 import optax
 import transformers
 from flax import traverse_util
@@ -69,7 +71,7 @@ from datasets.dataset_dict import DatasetDict
 from optax import Schedule
 
 # Sharding
-from src.partition_utils import get_sharding_scheme
+from src.partition_utils import get_sharding_scheme, device_put_leaf
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +158,7 @@ class TrainingArguments:
             "help": "The name of the repository to keep in sync with the local `output_dir`."
         },
     )
+    hostname: Optional[str] = field(default=gethostname())
     hub_token: Optional[str] = field(
         default=None, metadata={"help": "The token to use to push to the Model Hub."}
     )
@@ -744,8 +747,18 @@ def main():
     if jax.process_index() == 0:
         wandb_project: str = training_args.wandb_project
         wandb_entity: str = training_args.wandb_entity
-        wandb_run_name = datetime.datetime.now().isoformat() + "-" + gethostname()
+        wandb_run_name = (
+            datetime.datetime.now().isoformat() + "-" + training_args.hostname
+        )
         wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name)
+        wandb.config.update(
+            {
+                **data_args.__dict__,
+                **training_args.__dict__,
+                **model_args.__dict__,
+                "num_global_devices": jax.device_count(),
+            }
+        )
 
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
@@ -812,18 +825,21 @@ def main():
     sharding_scheme = get_sharding_scheme(initial_params_cpu, num_replicas=1)
 
     print("Sending sharded model weights to accelerator(s).")
-    initial_params = jax.device_put(initial_params_cpu, device=sharding_scheme)
+    sharded_params = jax.tree_util.tree_map(
+        device_put_leaf, initial_params_cpu, sharding_scheme
+    )
 
     print("Initializing model weights on accelerator(s).")
-    filled_params = jax.jit(model.init_weights, static_argnames=["input_shape"])(
-        rng=jax.random.PRNGKey(training_args.seed),
-        input_shape=(train_batch_size, block_size),
-        params=initial_params,
-    )
+    with jax.spmd_mode("allow_all"):
+        sharded_params = jax.jit(model.init_weights, static_argnames=["input_shape"])(
+            rng=jax.random.PRNGKey(training_args.seed),
+            input_shape=(train_batch_size, block_size),
+            params=sharded_params,
+        )
 
     state = TrainState.create(
         apply_fn=model.__call__,
-        params=unfreeze(filled_params),
+        params=unfreeze(sharded_params),
         tx=optimizer,
         dropout_rng=dropout_rng,
     )
@@ -912,7 +928,12 @@ def main():
             step_start_time = time.time()
             batch = next(train_loader)
             effective_batch_size = len(batch["labels"].flatten())
-            state, train_metric = p_train_step(state, batch)
+
+            with jax.spmd_mode("allow_all"):
+                state, train_metric = p_train_step(state, batch)
+
+            train_metric = process_allgather(train_metric)
+            assert isinstance(train_metric, dict)
             train_metric["throughput"] = effective_batch_size / (
                 time.time() - step_start_time
             )
@@ -925,11 +946,6 @@ def main():
                 train_time += time.time() - train_start
                 if jax.process_index() == 0:
                     write_train_metric(train_metrics, train_time, cur_step)
-
-                epochs.write(
-                    f"Step... ({cur_step} | Loss: {train_metric['loss'].mean()}, Learning Rate:"
-                    f" {train_metric['learning_rate'].mean()})"
-                )
 
                 train_metrics = []
 
@@ -945,8 +961,11 @@ def main():
                 ):
                     # Model forward
                     batch = next(eval_loader)
-                    metrics = p_eval_step(state.params, batch)
-                    eval_metrics.append(metrics)
+
+                    with jax.spmd_mode("allow_all"):
+                        metrics = p_eval_step(state.params, batch)
+
+                    eval_metrics.append(process_allgather(metrics))
 
                 # normalize eval metrics
                 eval_metrics = stack_forest(eval_metrics)
@@ -991,8 +1010,10 @@ def main():
         for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
             # Model forward
             batch = next(eval_loader)
-            metrics = p_eval_step(state.params, batch)
-            eval_metrics.append(metrics)
+            with jax.spmd_mode("allow_all"):
+                metrics = p_eval_step(state.params, batch)
+
+            eval_metrics.append(process_allgather(metrics))
 
         # normalize eval metrics
         eval_metrics = stack_forest(eval_metrics)
