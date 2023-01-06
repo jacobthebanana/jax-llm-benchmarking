@@ -1,0 +1,20 @@
+python run_clm_flax.py \
+    --output_dir="/data/jax-benchmarking/models/opt-6.7b" \
+    --model_type="opt" \
+    --model_name_or_path="facebook/opt-6.7b" \
+    --tokenizer_name="facebook/opt-6.7b" \
+    --dataset_name="wikitext" \
+    --dataset_config_name="wikitext-103-v1" \
+    --do_train --do_eval \
+    --block_size="512" \
+    --per_device_train_batch_size="2" \
+    --per_device_eval_batch_size="2" \
+    --learning_rate="5e-3" --warmup_steps="1000" \
+    --adam_beta1="0.9" --adam_beta2="0.98" --weight_decay="0.01" \
+    --overwrite_output_dir \
+    --num_train_epochs="20" \
+    --logging_steps="500" \
+    --save_steps="2500" \
+    --eval_steps="2500" \
+    --wandb_entity="jacobthebanana" \
+    --wandb_project="jax-clm-benchmarking"

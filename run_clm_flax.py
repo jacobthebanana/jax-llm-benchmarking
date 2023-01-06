@@ -69,7 +69,7 @@ from datasets.dataset_dict import DatasetDict
 from optax import Schedule
 
 # Sharding
-from partition_utils import get_sharding_scheme
+from src.partition_utils import get_sharding_scheme
 
 logger = logging.getLogger(__name__)
 
@@ -481,6 +481,7 @@ def main():
     logger.info(f"Training/evaluation parameters {training_args}")
 
     # Set seed before initializing model.
+    jax.distributed.initialize()
     set_seed(training_args.seed)
 
     # Handle the repository creation

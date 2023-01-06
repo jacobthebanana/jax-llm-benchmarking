@@ -1,13 +1,17 @@
 """
-Utilities for generating sharding/partition layout specs.
+Utilities for sharding/partitioning LLM parameters.
 """
 import jax
 import jax.numpy as jnp
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.core.frozen_dict import unfreeze
+import chex
 
 from typing import Dict, List, Tuple, Union
 from jax.sharding import PositionalSharding
+
+# Typing
+from jaxlib.xla_extension import Device
 
 ShardingScheme = Dict[str, PositionalSharding]
 RecursiveShardingScheme = Dict[str, Union[ShardingScheme, "RecursiveShardingScheme"]]
@@ -19,8 +23,10 @@ def get_sharding_scheme(
     num_replicas: int = 1,
 ) -> RecursiveShardingScheme:
     """
-    Return sharding scheme for the given param dictionary.
-    Shard along the axis=0 whenever possible.
+    Return the "full" sharding scheme for the given param dictionary.
+    Shard along the axis=0 whenever possible. This sharding scheme
+    includes all devices in the pod slice, possibly including ones
+    that this CPU host cannot address.
 
     Extra keys will be included in the output and are replicated
     across all devices.
@@ -63,3 +69,44 @@ def get_sharding_scheme(
         replicated_param_keys[extra_key] = base_sharding.replicate()
 
     return unfreeze(unflatten_dict(replicated_param_keys))  # type: ignore
+
+
+def device_put_leaf(
+    leaf_array: jnp.ndarray, global_leaf_sharding: PositionalSharding
+) -> jnp.ndarray:
+    """
+    Given a leaf array and its "global" sharding scheme
+    (might include non-addressable devices), place shards of the leaf
+    array belonging to this host
+    (specifically, accelerators addressable by the current CPU host.)
+    to the appropriate accelerators.
+
+    Note that "slice" refers to the tuples that index
+    a high-dimensional jax.numpy array.
+
+    Params:
+      leaf_array: "leaf" of the param tree, including values that do
+      not belong to accelerator devices of the current CPU host.
+
+      global_leaf_sharding: PositionalSharding
+      (might include non-local accelerator devices.)
+
+    Returns:
+      ShardedDeviceArray
+    """
+    local_array_buffers = []
+    slices_by_device = global_leaf_sharding.addressable_devices_indices_map(
+        leaf_array.shape
+    )
+
+    for device in jax.local_devices():
+        shard_slice = slices_by_device[device]
+        local_array = jax.device_put(leaf_array[shard_slice], device)
+        local_array_buffers.append(local_array)
+
+    sharded_leaf_array = jax.make_array_from_single_device_arrays(
+        leaf_array.shape, global_leaf_sharding, local_array_buffers
+    )
+
+    chex.assert_equal_shape([leaf_array, sharded_leaf_array])
+    return sharded_leaf_array
