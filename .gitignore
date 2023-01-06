@@ -3,3 +3,4 @@ __pycache__
 logs/**
 wandb/**
 notebooks/**
+_launch_run_pod.sh
