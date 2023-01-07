@@ -10,8 +10,8 @@ from transformers import FlaxOPTModel, AutoTokenizer
 
 from ..partition_utils import get_sharding_scheme, device_put_leaf
 
-HF_MODEL_NAME = os.environ.get("TEST_HF_MODEL", "facebook/opt-350m")
-BLOCK_SIZE = int(os.environ.get("TEST_BLOCK_SIZE", "128"))
+TEST_HF_MODEL = os.environ.get("TEST_HF_MODEL", "facebook/opt-350m")
+TEST_BLOCK_SIZE = int(os.environ.get("TEST_BLOCK_SIZE", "128"))
 
 
 class StaticPartitioningTests(unittest.TestCase):
@@ -51,14 +51,15 @@ class LMPartitioningTests(unittest.TestCase):
     def setUpClass(cls):
         super(LMPartitioningTests, cls).setUpClass()
 
+        print("Loading full model weights for", TEST_HF_MODEL)
         cls.model, cls.params = FlaxOPTModel.from_pretrained(
-            HF_MODEL_NAME, _do_init=False
+            TEST_HF_MODEL, _do_init=False
         )  # type: ignore
 
     def setUp(self):
         self.sharding_scheme = get_sharding_scheme(LMPartitioningTests.params)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME)
+        self.tokenizer = AutoTokenizer.from_pretrained(TEST_HF_MODEL)
         self.example_batch = self.tokenizer(
             ["Vector Institute"],
             max_length=128,
@@ -67,12 +68,21 @@ class LMPartitioningTests(unittest.TestCase):
         )
 
     def test_sharded_forward(self):
+        model = LMPartitioningTests.model
         sharded_params = tree_map(
             device_put_leaf, LMPartitioningTests.params, self.sharding_scheme
         )
-        model_fn = jax.jit(LMPartitioningTests.model.__call__)
+
+        param_init_fn = jax.jit(model.init_weights, static_argnames=["input_shape"])
+        model_fn = jax.jit(model.__call__)
 
         with jax.spmd_mode("allow_all"):
+            sharded_params = param_init_fn(
+                jax.random.PRNGKey(0),
+                params=sharded_params,
+                input_shape=self.example_batch.input_ids.shape,
+            )
+
             example_output = model_fn(**self.example_batch, params=sharded_params)
 
         print(tree_map(jnp.shape, process_allgather(example_output)))
