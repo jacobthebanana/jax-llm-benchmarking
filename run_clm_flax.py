@@ -54,12 +54,15 @@ from transformers import (
     FLAX_MODEL_FOR_CAUSAL_LM_MAPPING,
     AutoConfig,
     AutoTokenizer,
-    FlaxAutoModelForCausalLM,
+    # FlaxAutoModelForCausalLM,
+    FlaxOPTForCausalLM,
     HfArgumentParser,
     set_seed,
 )
 from transformers.testing_utils import CaptureLogger
 from transformers.utils import get_full_repo_name, send_example_telemetry
+
+from src._vendors.modeling_flax_opt import FlaxOPTForCausalLM
 
 # WandB Integration
 import wandb
@@ -628,7 +631,7 @@ def main():
 
     print("Loading model weights to CPU.")
     if model_args.model_name_or_path:
-        model, initial_params_cpu = FlaxAutoModelForCausalLM.from_pretrained(
+        model, initial_params_cpu = FlaxOPTForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             config=config,
             seed=training_args.seed,
@@ -637,7 +640,7 @@ def main():
             _do_init=False,
         )
     else:
-        model, initial_params_cpu = FlaxAutoModelForCausalLM.from_config(
+        model, initial_params_cpu = FlaxOPTForCausalLM.from_config(
             config,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
@@ -857,8 +860,14 @@ def main():
         dropout_rng, new_dropout_rng = jax.random.split(state.dropout_rng)
 
         def compute_loss(params):
-            labels = batch.pop("labels")
-            logits = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng)[0]
+            labels = batch.get("labels")
+            actual_batch = {
+                "attention_mask": batch["attention_mask"],
+                "input_ids": batch["input_ids"],
+            }
+            logits = state.apply_fn(
+                **actual_batch, params=params, dropout_rng=dropout_rng
+            )[0]
             loss = loss_fn(logits, labels)
             return loss
 
@@ -907,7 +916,7 @@ def main():
 
     train_time = 0
     train_metrics = []
-    epochs = tqdm(range(num_epochs), desc="Epoch ... ", position=0)
+    epochs = tqdm(range(num_epochs), desc="Epoch ... ", position=0, ncols=80)
     for epoch in epochs:
         # ======================== Training ================================
         train_start = time.time()
@@ -923,7 +932,11 @@ def main():
 
         # train
         for step in tqdm(
-            range(steps_per_epoch), desc="Training...", position=1, leave=False
+            range(steps_per_epoch),
+            desc="Training...",
+            position=1,
+            leave=False,
+            ncols=80,
         ):
             step_start_time = time.time()
             batch = next(train_loader)
@@ -1007,7 +1020,9 @@ def main():
             input_rng, eval_dataset, eval_batch_size, drop_last=False
         )
         eval_steps = min(200, math.ceil(len(eval_dataset) / eval_batch_size))
-        for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
+        for _ in tqdm(
+            range(eval_steps), desc="Evaluating...", position=2, leave=False, ncols=80
+        ):
             # Model forward
             batch = next(eval_loader)
             with jax.spmd_mode("allow_all"):
